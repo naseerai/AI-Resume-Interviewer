@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  ai-resume-interviewer:
+    container_name: ai-resume-interviewer
+    build: .
+    restart: unless-stopped
+
+    ports:
+      - "3001:3000"
+
+    env_file:
+      - .env
+
+    environment:
+      NODE_ENV: production
+
+    volumes:
+      - ./uploads:/app/uploads
+
+    networks:
+      - ai-network
+
+networks:
+  ai-network:
+    driver: bridge

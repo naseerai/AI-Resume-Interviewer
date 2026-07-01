@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="AI Resume Interviewer – Smart AI-powered interview simulator that analyzes your resume and job description to conduct personalized mock interviews." />
+  <meta name="theme-color" content="#0a0a0f" />
+  <title>AI Resume Interviewer – Smart Interview Simulator</title>
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <!-- Marked.js for Markdown rendering -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+  <!-- html2pdf for PDF export -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+
+  <!-- Main CSS -->
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!--                    LOADING OVERLAY                         -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div id="loading-overlay" class="loading-overlay" role="status" aria-label="Loading">
+    <div class="loader-content">
+      <div class="loader-ring"></div>
+      <p id="loading-text" class="loader-text">Initializing...</p>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!--                    TOAST NOTIFICATIONS                     -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!--                      APP WRAPPER                           -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="app-wrapper">
+
+    <!-- ════════════════ SIDEBAR ════════════════ -->
+    <aside class="sidebar" id="sidebar" role="navigation" aria-label="Application Sidebar">
+
+      <!-- Sidebar Header -->
+      <div class="sidebar-header">
+        <div class="logo">
+          <div class="logo-icon" aria-hidden="true">
+            <svg viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <circle cx="20" cy="20" r="19" stroke="url(#grad)" stroke-width="2"/>
+              <path d="M12 16h16M12 20h10M12 24h13" stroke="url(#grad)" stroke-width="2" stroke-linecap="round"/>
+              <circle cx="28" cy="24" r="5" fill="url(#grad2)" opacity="0.9"/>
+              <path d="M26 24l1.5 1.5L30 22" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+              <defs>
+                <linearGradient id="grad" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#6c63ff"/>
+                  <stop offset="1" stop-color="#3ecfcf"/>
+                </linearGradient>
+                <linearGradient id="grad2" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#6c63ff"/>
+                  <stop offset="1" stop-color="#3ecfcf"/>
+                </linearGradient>
+              </defs>
+            </svg>
+          </div>
+          <div class="logo-text">
+            <span class="logo-title">AI Interviewer</span>
+            <span class="logo-subtitle">Resume Simulator</span>
+          </div>
+        </div>
+        <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle sidebar" title="Toggle Sidebar">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M3 12h18M3 6h18M3 18h18" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Upload Section -->
+      <div class="sidebar-section">
+        <p class="sidebar-section-label">Documents</p>
+
+        <!-- Resume Upload -->
+        <div class="upload-card" id="resume-upload-card">
+          <div class="upload-header">
+            <div class="upload-icon resume-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" stroke-linecap="round" stroke-linejoin="round"/>
+                <polyline points="14 2 14 8 20 8" stroke-linecap="round" stroke-linejoin="round"/>
+                <line x1="16" y1="13" x2="8" y2="13" stroke-linecap="round"/>
+                <line x1="16" y1="17" x2="8" y2="17" stroke-linecap="round"/>
+                <line x1="10" y1="9" x2="8" y2="9" stroke-linecap="round"/>
+              </svg>
+            </div>
+            <div>
+              <p class="upload-title">Resume</p>
+              <p class="upload-hint">PDF, DOCX</p>
+            </div>
+            <div class="upload-status" id="resume-status" aria-label="Resume upload status"></div>
+          </div>
+          <label class="upload-btn" for="resume-file-input" id="resume-upload-btn" role="button" tabindex="0"
+            aria-label="Upload resume file">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            Upload Resume
+          </label>
+          <input type="file" id="resume-file-input" class="file-input" accept=".pdf,.docx,.doc"
+            aria-label="Select resume file" />
+          <div class="upload-preview" id="resume-preview"></div>
+        </div>
+
+        <!-- JD Paste -->
+        <div class="upload-card" id="jd-upload-card">
+          <div class="upload-header">
+            <div class="upload-icon jd-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M3 9h18M9 21V9" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </div>
+            <div>
+              <p class="upload-title">Job Description</p>
+              <p class="upload-hint">Paste the JD text below</p>
+            </div>
+            <div class="upload-status" id="jd-status" aria-label="JD paste status"></div>
+          </div>
+          <textarea
+            id="jd-paste-input"
+            class="jd-paste-textarea"
+            placeholder="Paste the full job description here…"
+            rows="5"
+            maxlength="20000"
+            aria-label="Job description text"
+          ></textarea>
+          <div class="jd-paste-footer">
+            <span class="jd-char-count" id="jd-char-count">0 / 20000</span>
+            <button class="upload-btn jd-save-btn" id="jd-save-btn"
+              aria-label="Save job description" title="Save JD (Ctrl+Shift+J)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                <path d="M20 6L9 17l-5-5" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              Save JD
+            </button>
+          </div>
+          <div class="upload-preview" id="jd-preview"></div>
+        </div>
+      </div>
+
+      <!-- Profile Card (shown after analysis) -->
+      <div class="profile-card" id="profile-card" style="display:none;">
+        <div class="profile-header">
+          <div class="profile-avatar" id="profile-avatar" aria-hidden="true">N</div>
+          <div class="profile-info">
+            <p class="profile-name" id="profile-name">Candidate</p>
+            <p class="profile-level" id="profile-level">Experience Level</p>
+          </div>
+        </div>
+        <div class="profile-scores">
+          <div class="score-item">
+            <span class="score-label">JD Match</span>
+            <div class="score-bar-wrap">
+              <div class="score-bar" id="jd-match-bar" style="width: 0%"></div>
+            </div>
+            <span class="score-value" id="jd-match-val">0%</span>
+          </div>
+          <div class="score-item">
+            <span class="score-label">ATS Score</span>
+            <div class="score-bar-wrap">
+              <div class="score-bar ats" id="ats-score-bar" style="width: 0%"></div>
+            </div>
+            <span class="score-value" id="ats-score-val">0%</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Interview Controls -->
+      <div class="sidebar-section">
+        <p class="sidebar-section-label">Interview</p>
+        <div class="sidebar-actions">
+          <button class="action-btn primary" id="start-interview-btn" disabled
+            aria-label="Start interview" title="Start Interview (Ctrl+Enter)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+              <polygon points="5 3 19 12 5 21 5 3" fill="currentColor"/>
+            </svg>
+            Start Interview
+          </button>
+          <button class="action-btn danger" id="restart-btn" disabled
+            aria-label="Restart interview" title="Restart Interview">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+              <path d="M3 12a9 9 0 009 9 9.75 9.75 0 006.74-2.74M3 12V8m0 4H7" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M21 12a9 9 0 00-9-9 9.75 9.75 0 00-6.74 2.74" stroke-linecap="round"/>
+            </svg>
+            Restart
+          </button>
+          <button class="action-btn secondary" id="report-btn" disabled
+            aria-label="View interview report" title="Generate Interview Report">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+              <path d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            View Report
+          </button>
+          <button class="action-btn ghost" id="clear-chat-btn"
+            aria-label="Clear chat history" title="Clear Chat">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+              <polyline points="3 6 5 6 21 6" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M19 6l-1 14H6L5 6" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M10 11v6M14 11v6" stroke-linecap="round"/>
+              <path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            Clear Chat
+          </button>
+        </div>
+      </div>
+
+      <!-- Interview Stats -->
+      <div class="interview-stats" id="interview-stats" style="display:none;">
+        <div class="stat-item">
+          <span class="stat-icon">❓</span>
+          <span class="stat-label">Questions</span>
+          <span class="stat-value" id="stat-questions">0</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-icon">⏱️</span>
+          <span class="stat-label">Time</span>
+          <span class="stat-value" id="stat-timer">00:00</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-icon">📊</span>
+          <span class="stat-label">Level</span>
+          <span class="stat-value" id="stat-difficulty">Easy</span>
+        </div>
+      </div>
+
+      <!-- Sidebar Footer -->
+      <div class="sidebar-footer">
+        <button class="footer-btn" id="theme-toggle-btn" aria-label="Toggle dark/light mode" title="Toggle Theme">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" id="theme-icon">
+            <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Dark Mode
+        </button>
+        <button class="footer-btn" id="keyboard-shortcuts-btn" aria-label="Show keyboard shortcuts" title="Keyboard Shortcuts">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+            <rect x="2" y="7" width="20" height="14" rx="2" ry="2"/>
+            <path d="M16 21V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v16"/>
+          </svg>
+          Shortcuts
+        </button>
+      </div>
+    </aside>
+
+    <!-- ════════════════ MAIN CONTENT ════════════════ -->
+    <main class="main-content" id="main-content">
+
+      <!-- Mobile Header -->
+      <div class="mobile-header">
+        <button class="mobile-menu-btn" id="mobile-menu-btn" aria-label="Open sidebar">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M3 12h18M3 6h18M3 18h18" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <span class="mobile-title">AI Interviewer</span>
+        <div class="mobile-status" id="mobile-status"></div>
+      </div>
+
+      <!-- ── WELCOME SCREEN ── -->
+      <section class="welcome-screen" id="welcome-screen" aria-label="Welcome screen">
+        <div class="welcome-content">
+          <div class="welcome-logo" aria-hidden="true">
+            <div class="welcome-logo-ring"></div>
+            <svg viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg" class="welcome-logo-svg">
+              <circle cx="40" cy="40" r="38" stroke="url(#wgrad)" stroke-width="3"/>
+              <path d="M24 32h32M24 40h20M24 48h26" stroke="url(#wgrad)" stroke-width="3" stroke-linecap="round"/>
+              <circle cx="56" cy="48" r="10" fill="url(#wgrad2)" opacity="0.9"/>
+              <path d="M52 48l3 3L60 44" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+              <defs>
+                <linearGradient id="wgrad" x1="0" y1="0" x2="80" y2="80" gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#6c63ff"/>
+                  <stop offset="1" stop-color="#3ecfcf"/>
+                </linearGradient>
+                <linearGradient id="wgrad2" x1="0" y1="0" x2="80" y2="80" gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#6c63ff"/>
+                  <stop offset="1" stop-color="#3ecfcf"/>
+                </linearGradient>
+              </defs>
+            </svg>
+          </div>
+          <h1 class="welcome-title">AI Resume Interviewer</h1>
+          <p class="welcome-subtitle">Experience a real interview powered by AI. Upload your resume and job description to begin your personalized mock interview session.</p>
+
+          <div class="welcome-steps">
+            <div class="step-card">
+              <div class="step-num">1</div>
+              <div class="step-body">
+                <h3>Upload Resume</h3>
+                <p>PDF or DOCX format. The AI will analyze your skills, experience, and projects.</p>
+              </div>
+            </div>
+            <div class="step-connector" aria-hidden="true"></div>
+            <div class="step-card">
+              <div class="step-num">2</div>
+              <div class="step-body">
+                <h3>Add Job Description</h3>
+                <p>Paste or upload the JD. AI will match your profile and identify gaps.</p>
+              </div>
+            </div>
+            <div class="step-connector" aria-hidden="true"></div>
+            <div class="step-card">
+              <div class="step-num">3</div>
+              <div class="step-body">
+                <h3>Start Interview</h3>
+                <p>Get a personalized interview experience just like Amazon, Google, or Microsoft.</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="welcome-features">
+            <span class="feature-chip">🎯 Personalized Questions</span>
+            <span class="feature-chip">💡 Answer Hints</span>
+            <span class="feature-chip">📊 Live Feedback</span>
+            <span class="feature-chip">🗣️ Voice Mode</span>
+            <span class="feature-chip">📄 PDF Report</span>
+            <span class="feature-chip">🔥 Adaptive Difficulty</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── CHAT INTERFACE ── -->
+      <section class="chat-section" id="chat-section" style="display:none;" aria-label="Chat interview interface">
+
+        <!-- Progress bar -->
+        <div class="progress-bar-wrap" aria-label="Interview progress">
+          <div class="progress-bar" id="progress-bar" style="width: 0%"></div>
+        </div>
+
+        <!-- Interview header bar -->
+        <div class="chat-header" id="chat-header">
+          <div class="interviewer-info">
+            <div class="interviewer-avatar" aria-hidden="true">
+              <svg viewBox="0 0 32 32" fill="none">
+                <circle cx="16" cy="16" r="15" fill="url(#ihgrad)" opacity="0.2"/>
+                <circle cx="16" cy="12" r="5" fill="url(#ihgrad)"/>
+                <path d="M6 26c0-5.523 4.477-10 10-10s10 4.477 10 10" stroke="url(#ihgrad)" stroke-width="2" stroke-linecap="round"/>
+                <defs>
+                  <linearGradient id="ihgrad" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+                    <stop stop-color="#6c63ff"/>
+                    <stop offset="1" stop-color="#3ecfcf"/>
+                  </linearGradient>
+                </defs>
+              </svg>
+            </div>
+            <div>
+              <p class="interviewer-name">Senior Interviewer</p>
+              <p class="interviewer-status" id="interviewer-status">
+                <span class="status-dot active" aria-hidden="true"></span>
+                Interview in Progress
+              </p>
+            </div>
+          </div>
+          <div class="chat-header-actions">
+            <div class="difficulty-badge" id="difficulty-badge">Easy</div>
+            <span class="question-counter" id="question-counter" aria-label="Question count">Q: 0</span>
+            <button class="icon-btn" id="voice-toggle-btn" title="Toggle Voice Mode" aria-label="Toggle voice mode">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+            <button class="icon-btn" id="end-interview-btn" title="End Interview" aria-label="End interview">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <rect x="3" y="3" width="18" height="18" rx="2" fill="currentColor" opacity="0.15"/>
+                <rect x="3" y="3" width="18" height="18" rx="2" stroke-linecap="round"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Chat Messages Area -->
+        <div class="chat-messages" id="chat-messages" role="log" aria-live="polite" aria-label="Chat messages">
+          <!-- Messages will be injected here -->
+        </div>
+
+        <!-- Typing Indicator -->
+        <div class="typing-indicator" id="typing-indicator" aria-label="AI is typing" style="display:none;">
+          <div class="typing-avatar" aria-hidden="true">AI</div>
+          <div class="typing-dots">
+            <span></span><span></span><span></span>
+          </div>
+          <span class="typing-text">Thinking...</span>
+        </div>
+
+        <!-- Input Area -->
+        <div class="chat-input-area" id="chat-input-area">
+          <div class="input-toolbar">
+            <button class="toolbar-btn" id="hint-btn" title="Get Answer Hint (Ctrl+H)" aria-label="Get answer hint">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                <circle cx="12" cy="12" r="10"/>
+                <path d="M12 16v-4M12 8h.01" stroke-linecap="round"/>
+              </svg>
+              Hint
+            </button>
+            <button class="toolbar-btn" id="voice-input-btn" title="Voice Input (Ctrl+M)" aria-label="Voice input">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                <path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z" stroke-linecap="round"/>
+                <path d="M19 10v2a7 7 0 01-14 0v-2" stroke-linecap="round"/>
+              </svg>
+              Voice
+            </button>
+            <button class="toolbar-btn" id="skip-btn" title="Skip Question" aria-label="Skip question">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                <path d="M5 4l15 8-15 8V4zM19 4v16" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              Skip
+            </button>
+          </div>
+          <div class="input-wrapper">
+            <textarea
+              id="answer-input"
+              class="answer-textarea"
+              placeholder="Type your answer here... (Ctrl+Enter to send)"
+              rows="1"
+              maxlength="5000"
+              aria-label="Your answer"
+              aria-multiline="true"
+            ></textarea>
+            <button class="send-btn" id="send-btn" title="Send Answer (Ctrl+Enter)" aria-label="Send answer">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                <line x1="22" y1="2" x2="11" y2="13" stroke-linecap="round"/>
+                <polygon points="22 2 15 22 11 13 2 9 22 2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
+          <div class="input-footer">
+            <span class="char-count" id="char-count">0 / 5000</span>
+            <span class="shortcut-hint">Ctrl+Enter to send • Ctrl+H for hint • Ctrl+M for voice</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── REPORT SECTION ── -->
+      <section class="report-section" id="report-section" style="display:none;" aria-label="Interview report">
+        <div class="report-container" id="report-container">
+          <!-- Report will be injected here -->
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!--                     HINT MODAL                             -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="modal-overlay" id="hint-modal" role="dialog" aria-modal="true" aria-labelledby="hint-modal-title" style="display:none;">
+    <div class="modal">
+      <div class="modal-header">
+        <h2 id="hint-modal-title">
+          <span aria-hidden="true">💡</span> Answer Guide
+        </h2>
+        <button class="modal-close" id="hint-modal-close" aria-label="Close hint modal">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18" stroke-linecap="round"/>
+            <line x1="6" y1="6" x2="18" y2="18" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body" id="hint-modal-body">
+        <div class="hint-loading">
+          <div class="loader-ring small"></div>
+          <p>Generating answer guide...</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!--                  KEYBOARD SHORTCUTS MODAL                  -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="modal-overlay" id="shortcuts-modal" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title" style="display:none;">
+    <div class="modal shortcuts-modal">
+      <div class="modal-header">
+        <h2 id="shortcuts-title">⌨️ Keyboard Shortcuts</h2>
+        <button class="modal-close" id="shortcuts-modal-close" aria-label="Close shortcuts modal">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18" stroke-linecap="round"/>
+            <line x1="6" y1="6" x2="18" y2="18" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <table class="shortcuts-table" aria-label="Keyboard shortcuts">
+          <thead><tr><th>Action</th><th>Shortcut</th></tr></thead>
+          <tbody>
+            <tr><td>Send Answer</td><td><kbd>Ctrl</kbd>+<kbd>Enter</kbd></td></tr>
+            <tr><td>Get Hint</td><td><kbd>Ctrl</kbd>+<kbd>H</kbd></td></tr>
+            <tr><td>Voice Input</td><td><kbd>Ctrl</kbd>+<kbd>M</kbd></td></tr>
+            <tr><td>Skip Question</td><td><kbd>Ctrl</kbd>+<kbd>K</kbd></td></tr>
+            <tr><td>Toggle Sidebar</td><td><kbd>Ctrl</kbd>+<kbd>B</kbd></td></tr>
+            <tr><td>Start Interview</td><td><kbd>Ctrl</kbd>+<kbd>I</kbd></td></tr>
+            <tr><td>Toggle Theme</td><td><kbd>Ctrl</kbd>+<kbd>T</kbd></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!--                  VOICE INDICATOR                           -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="voice-overlay" id="voice-overlay" style="display:none;" aria-live="assertive">
+    <div class="voice-content">
+      <div class="voice-wave" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <p class="voice-text">Listening...</p>
+      <button class="voice-stop-btn" id="voice-stop-btn" aria-label="Stop listening">
+        Stop
+      </button>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!--                     SCRIPTS                                -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <script src="/js/utils.js"></script>
+  <script src="/js/voice.js"></script>
+  <script src="/js/upload.js"></script>
+  <script src="/js/chat.js"></script>
+  <script src="/js/interview.js"></script>
+  <script src="/js/report.js"></script>
+  <script src="/js/main.js"></script>
+</body>
+</html>
