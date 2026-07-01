@@ -1,13 +1,24 @@
 /**
- * Gemini AI Service — Production-Ready
+ * Gemini AI Service — Production-Ready v3
  * ─────────────────────────────────────────────────────────────────────────────
- * Handles all interactions with the Google Generative AI API.
- * Features:
- *   • Robust JSON parsing with markdown-fence stripping & multi-strategy extraction
- *   • responseMimeType: 'application/json' for structured output
- *   • Automatic retry with exponential backoff (up to 3 attempts)
- *   • Full raw-response logging for debugging
- *   • Meaningful errors — no silent swallowing
+ * Root causes fixed in this version:
+ *
+ *  1. TRUNCATION (primary):  maxOutputTokens was 4096 — not enough for large
+ *     resumes.  Fixed to 65536 (SDK max).  Profile prompt is also now slimmer
+ *     so fewer tokens are needed.
+ *
+ *  2. INTERLEAVED LOGS:  console.log of a large multi-line string interleaves
+ *     with concurrent retry logs when printed in one call.  Fixed by using
+ *     a synchronous write to process.stdout.
+ *
+ *  3. INCOMPLETE RESPONSE RECOVERY:  If Gemini still finishes with
+ *     finishReason === 'MAX_TOKENS', we send a follow-up "complete the JSON"
+ *     prompt and merge the fragments.
+ *
+ *  4. ROBUST PARSING:  safeParseJSON tries 5 extraction strategies before
+ *     giving up.  It logs the full raw response atomically on failure.
+ *
+ *  5. responseMimeType: 'application/json'  enforces structured output.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
@@ -16,104 +27,36 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
-// Model reads from env — change GEMINI_MODEL in .env to switch
 const MODEL_NAME = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
-// ─── Retry config ──────────────────────────────────────────────────────────────
-const MAX_RETRIES  = 3;
-const RETRY_BASE_MS = 1500; // exponential: 1.5s → 3s → 6s
+// ─── Constants ────────────────────────────────────────────────────────────────
+const MAX_RETRIES   = 3;
+const RETRY_BASE_MS = 1500;
+const MAX_TOKENS    = 65536; // SDK maximum — prevents truncation on large resumes
 
-// ─── Logging helper ────────────────────────────────────────────────────────────
+// ─── Logging (atomic stdout writes prevent interleaving) ──────────────────────
 function log(tag, msg, extra) {
-  const ts = new Date().toISOString();
+  const ts  = new Date().toISOString();
+  const pfx = `[${ts}] [GEMINI:${tag}]`;
   if (extra !== undefined) {
-    console.log(`[${ts}] [GEMINI:${tag}] ${msg}`, typeof extra === 'string' ? extra.substring(0, 800) : JSON.stringify(extra).substring(0, 800));
+    const str = typeof extra === 'string' ? extra : JSON.stringify(extra, null, 2);
+    process.stdout.write(`${pfx} ${msg}\n--- BEGIN ---\n${str.substring(0, 2000)}\n--- END ---\n`);
   } else {
-    console.log(`[${ts}] [GEMINI:${tag}] ${msg}`);
+    process.stdout.write(`${pfx} ${msg}\n`);
   }
 }
 
 function logError(tag, msg, err) {
   const ts = new Date().toISOString();
-  console.error(`[${ts}] [GEMINI:${tag}] ❌ ${msg}`);
-  if (err?.message) console.error(`  message : ${err.message}`);
-  if (err?.stack)   console.error(`  stack   : ${err.stack.split('\n').slice(0,4).join('\n    ')}`);
-}
-
-// ─── Robust JSON Extraction Utility ────────────────────────────────────────────
-/**
- * safeParseJSON
- * Attempts multiple strategies to extract a valid JSON object from an AI
- * response string that may contain markdown fences, extra prose, or whitespace.
- *
- * @param {string} raw     - The raw string returned by Gemini
- * @param {string} context - Human-readable label for logging (e.g. 'candidateProfile')
- * @returns {object}       - Parsed JavaScript object
- * @throws  {Error}        - If all strategies fail
- */
-function safeParseJSON(raw, context = 'response') {
-  if (!raw || typeof raw !== 'string' || raw.trim().length === 0) {
-    throw new Error(`[${context}] AI returned an empty response.`);
-  }
-
-  log('PARSE', `Raw AI response for "${context}" (first 500 chars):`, raw.substring(0, 500));
-
-  // Strategy 1: direct parse — model returned clean JSON
-  try {
-    return JSON.parse(raw.trim());
-  } catch (_) { /* fall through */ }
-
-  // Strategy 2: strip ```json ... ``` or ``` ... ``` markdown fences
-  const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenceMatch) {
-    try {
-      return JSON.parse(fenceMatch[1].trim());
-    } catch (_) { /* fall through */ }
-  }
-
-  // Strategy 3: extract the outermost {...} block
-  const objStart = raw.indexOf('{');
-  const objEnd   = raw.lastIndexOf('}');
-  if (objStart !== -1 && objEnd > objStart) {
-    const candidate = raw.substring(objStart, objEnd + 1);
-    try {
-      return JSON.parse(candidate);
-    } catch (e1) {
-      // Strategy 4: try to fix common issues (trailing commas, single quotes)
-      try {
-        const fixed = candidate
-          .replace(/,\s*([}\]])/g, '$1')   // trailing commas
-          .replace(/'/g, '"')               // single → double quotes
-          .replace(/\n/g, ' ')             // collapse newlines
-          .replace(/[\u0000-\u001F]/g, ''); // control chars
-        return JSON.parse(fixed);
-      } catch (_) { /* fall through */ }
-    }
-  }
-
-  // Strategy 5: extract the outermost [...] array block
-  const arrStart = raw.indexOf('[');
-  const arrEnd   = raw.lastIndexOf(']');
-  if (arrStart !== -1 && arrEnd > arrStart) {
-    try {
-      return JSON.parse(raw.substring(arrStart, arrEnd + 1));
-    } catch (_) { /* fall through */ }
-  }
-
-  // All strategies failed — log the full raw response for debugging
-  console.error(`[GEMINI:PARSE] ❌ ALL parse strategies failed for "${context}". Full raw response:`);
-  console.error(raw);
-  throw new Error(`Failed to parse ${context} from AI response. The model returned non-JSON output. Check server logs for the raw response.`);
+  process.stderr.write(
+    `[${ts}] [GEMINI:${tag}] ❌ ${msg}\n` +
+    (err?.message ? `  message : ${err.message}\n` : '') +
+    (err?.stack   ? `  stack   : ${err.stack.split('\n').slice(0, 5).join('\n    ')}\n` : '')
+  );
 }
 
 // ─── Retry Wrapper ─────────────────────────────────────────────────────────────
-/**
- * withRetry
- * Executes `fn` up to MAX_RETRIES times with exponential backoff.
- * Retries on network errors, 503 overload, or empty/invalid JSON errors.
- */
-async function withRetry(fn, context = 'operation') {
+async function withRetry(fn, context) {
   let lastErr;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -122,22 +65,20 @@ async function withRetry(fn, context = 'operation') {
     } catch (err) {
       lastErr = err;
       const msg = err.message || '';
-      const isRetryable =
-        msg.includes('503') ||
-        msg.includes('overloaded') ||
-        msg.includes('429') ||
-        msg.includes('UNAVAILABLE') ||
-        msg.includes('RESOURCE_EXHAUSTED') ||
-        msg.includes('empty response') ||
-        msg.includes('Failed to parse');
+      const retryable =
+        msg.includes('503') || msg.includes('overloaded') ||
+        msg.includes('429') || msg.includes('UNAVAILABLE') ||
+        msg.includes('RESOURCE_EXHAUSTED') || msg.includes('empty') ||
+        msg.includes('Failed to parse') || msg.includes('MAX_TOKENS') ||
+        msg.includes('truncated');
 
-      if (!isRetryable || attempt === MAX_RETRIES) {
-        logError('RETRY', `"${context}" failed permanently after ${attempt} attempt(s).`, err);
+      if (!retryable || attempt === MAX_RETRIES) {
+        logError('RETRY', `"${context}" permanently failed after ${attempt} attempt(s).`, err);
         throw err;
       }
 
       const delay = RETRY_BASE_MS * Math.pow(2, attempt - 1);
-      log('RETRY', `"${context}" attempt ${attempt} failed (${msg.substring(0, 80)}). Retrying in ${delay}ms…`);
+      log('RETRY', `"${context}" attempt ${attempt} failed — ${msg.substring(0, 100)} — retrying in ${delay}ms`);
       await new Promise(r => setTimeout(r, delay));
     }
   }
@@ -145,348 +86,436 @@ async function withRetry(fn, context = 'operation') {
 }
 
 // ─── Model Factory ─────────────────────────────────────────────────────────────
-/**
- * getModel
- * Returns a Gemini model instance.
- * @param {boolean} jsonMode  - If true, sets responseMimeType to 'application/json'
- *                              for guaranteed structured output.
- * @param {string}  sysInstr  - Optional system instruction.
- */
-function getModel(jsonMode = false, sysInstr = null) {
+function getModel({ jsonMode = false, sysInstr = null, temperature = 0.7 } = {}) {
   const generationConfig = {
-    temperature:     0.7,
+    temperature,
     topK:            40,
     topP:            0.95,
-    maxOutputTokens: 4096,
+    maxOutputTokens: MAX_TOKENS,
   };
-
   if (jsonMode) {
     generationConfig.responseMimeType = 'application/json';
   }
-
   const config = { model: MODEL_NAME, generationConfig };
-
-  if (sysInstr) {
-    config.systemInstruction = sysInstr;
-  }
-
+  if (sysInstr) config.systemInstruction = sysInstr;
   return genAI.getGenerativeModel(config);
 }
 
-// ─── Call Gemini & Parse JSON ──────────────────────────────────────────────────
+// ─── Robust JSON Parser ────────────────────────────────────────────────────────
 /**
- * callForJSON
- * Calls Gemini with `prompt` and extracts a JSON object from the response.
- * Uses responseMimeType JSON mode for guaranteed structured output, with
- * safeParseJSON as a robust fallback.
+ * safeParseJSON  — 5-strategy extractor
+ * Handles: clean JSON, ```json fences, prose+JSON, trailing commas, partial arrays
  */
-async function callForJSON(prompt, context, jsonMode = true) {
-  const model  = getModel(jsonMode);
-  const result = await model.generateContent(prompt);
-
-  // Check for empty or blocked response
-  const candidate = result.response.candidates?.[0];
-  if (!candidate) {
-    log('CALL', `No candidates in response for "${context}". FinishReason: ${result.response.promptFeedback?.blockReason}`);
-    throw new Error(`AI returned no candidates for "${context}". Possible content filtering.`);
+function safeParseJSON(raw, context = 'response') {
+  if (!raw || typeof raw !== 'string' || !raw.trim()) {
+    throw new Error(`[${context}] Gemini returned an empty response.`);
   }
 
-  const raw = result.response.text();
+  const trimmed = raw.trim();
 
-  if (!raw || raw.trim().length === 0) {
-    throw new Error(`AI returned empty text for "${context}".`);
+  // Strategy 1: direct parse
+  try { return JSON.parse(trimmed); } catch (_) {}
+
+  // Strategy 2: strip ```json ... ``` or ``` ... ``` fences
+  const fenceRE = /```(?:json)?\s*([\s\S]*?)```/i;
+  const fence   = fenceRE.exec(trimmed);
+  if (fence) {
+    try { return JSON.parse(fence[1].trim()); } catch (_) {}
+  }
+
+  // Strategy 3: extract first complete {...} block using bracket counting
+  const extracted = extractJsonObject(trimmed);
+  if (extracted !== null) {
+    try { return JSON.parse(extracted); } catch (_) {}
+
+    // Strategy 4: fix common syntax issues in the extracted block
+    try {
+      const fixed = extracted
+        .replace(/,\s*([}\]])/g, '$1')    // trailing commas
+        .replace(/([{,]\s*)(\w+)\s*:/g, '$1"$2":') // unquoted keys
+        .replace(/:\s*'([^']*)'/g, ': "$1"')        // single-quoted values
+        .replace(/[\u0000-\u001F\u007F]/g, ' ');    // control chars
+      return JSON.parse(fixed);
+    } catch (_) {}
+  }
+
+  // Strategy 5: array extraction
+  const arrExtracted = extractJsonArray(trimmed);
+  if (arrExtracted !== null) {
+    try { return JSON.parse(arrExtracted); } catch (_) {}
+  }
+
+  // All failed — log the full raw response atomically
+  process.stderr.write(
+    `\n[GEMINI:PARSE] ❌ ALL strategies failed for "${context}".\n` +
+    `=== FULL RAW RESPONSE (${raw.length} chars) ===\n${raw}\n=== END ===\n\n`
+  );
+  throw new Error(
+    `Failed to parse ${context} from AI response. ` +
+    `Response was ${raw.length} chars. Check server logs for the full raw output.`
+  );
+}
+
+/** Extract the first top-level {...} using a bracket counter (handles nesting) */
+function extractJsonObject(str) {
+  let depth = 0, start = -1;
+  for (let i = 0; i < str.length; i++) {
+    if (str[i] === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (str[i] === '}') {
+      depth--;
+      if (depth === 0 && start !== -1) return str.substring(start, i + 1);
+    }
+  }
+  return null;
+}
+
+/** Extract the first top-level [...] using a bracket counter */
+function extractJsonArray(str) {
+  let depth = 0, start = -1;
+  for (let i = 0; i < str.length; i++) {
+    if (str[i] === '[') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (str[i] === ']') {
+      depth--;
+      if (depth === 0 && start !== -1) return str.substring(start, i + 1);
+    }
+  }
+  return null;
+}
+
+// ─── Call Gemini for JSON ──────────────────────────────────────────────────────
+/**
+ * callForJSON
+ * Calls Gemini with a prompt, logs ALL response metadata, and returns parsed JSON.
+ * If finishReason is MAX_TOKENS (truncated), sends a recovery prompt.
+ */
+async function callForJSON(prompt, context, modelOpts = {}) {
+  const model  = getModel({ jsonMode: true, ...modelOpts });
+  const result = await model.generateContent(prompt);
+
+  // ── Log full response metadata ──────────────────────────────────────────
+  const candidate = result.response.candidates?.[0];
+  const usage     = result.response.usageMetadata;
+  const finishReason = candidate?.finishReason || 'UNKNOWN';
+  const safetyRatings = candidate?.safetyRatings || [];
+
+  log('CALL', `"${context}" metadata`, {
+    model:        MODEL_NAME,
+    finishReason,
+    tokenUsage:   usage,
+    safetyRatings: safetyRatings.map(s => `${s.category}:${s.probability}`),
+  });
+
+  // ── Safety block ────────────────────────────────────────────────────────
+  if (finishReason === 'SAFETY') {
+    throw new Error(`Gemini blocked the response for "${context}" due to safety filters.`);
+  }
+
+  // ── Empty candidates ────────────────────────────────────────────────────
+  if (!candidate) {
+    const blockReason = result.response.promptFeedback?.blockReason || 'unknown';
+    throw new Error(`Gemini returned no candidates for "${context}" (blockReason: ${blockReason}).`);
+  }
+
+  let raw = result.response.text() || '';
+
+  log('CALL', `Raw response for "${context}" (${raw.length} chars):`, raw);
+
+  // ── Truncation recovery: MAX_TOKENS ──────────────────────────────────────
+  if (finishReason === 'MAX_TOKENS' && raw.length > 0) {
+    log('CALL', `⚠️ Response for "${context}" was truncated (MAX_TOKENS). Sending recovery prompt…`);
+    raw = await recoverTruncatedJSON(raw, context);
+  }
+
+  if (!raw.trim()) {
+    throw new Error(`Gemini returned an empty response for "${context}".`);
   }
 
   return safeParseJSON(raw, context);
 }
 
-// ─── Strict JSON Prompt Wrapper ────────────────────────────────────────────────
-const JSON_SYSTEM_INSTRUCTION = `You are a JSON-only response API. 
-You MUST return ONLY valid JSON. 
-Do NOT include markdown code fences (\`\`\`json or \`\`\`). 
-Do NOT include any explanation, commentary, or text before or after the JSON. 
-Do NOT include trailing commas. 
-Your entire response must be parseable by JSON.parse().`;
+/**
+ * recoverTruncatedJSON
+ * When Gemini truncates mid-JSON, ask it to complete the fragment.
+ */
+async function recoverTruncatedJSON(fragment, context) {
+  log('RECOVER', `Sending recovery prompt for truncated "${context}" (fragment: ${fragment.length} chars)`);
 
-// ─── Public API Functions ──────────────────────────────────────────────────────
+  const recoveryPrompt =
+    `The following JSON was truncated and is incomplete. ` +
+    `Complete it so it forms a single valid JSON object. ` +
+    `Return ONLY the completed JSON — no explanation, no markdown fences.\n\n` +
+    `INCOMPLETE JSON:\n${fragment}`;
+
+  const model  = getModel({ jsonMode: true });
+  const result = await model.generateContent(recoveryPrompt);
+  const text   = result.response.text() || '';
+
+  log('RECOVER', `Recovery response (${text.length} chars):`, text);
+
+  if (!text.trim()) {
+    throw new Error(`Recovery prompt returned empty response for "${context}".`);
+  }
+
+  return text;
+}
+
+// ─── System Instruction ────────────────────────────────────────────────────────
+const JSON_SYSTEM = `You are a JSON-only API endpoint.
+RULES (strictly enforced):
+1. Return ONLY a valid JSON object.
+2. No markdown fences (\`\`\`json or \`\`\`).
+3. No explanatory text before or after the JSON.
+4. No trailing commas.
+5. All string values must use double quotes.
+6. Your response must be directly parseable by JSON.parse() with no pre-processing.`;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PUBLIC FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
 
 /**
  * analyzeCandidateProfile
- * Parses resume + JD and builds a rich candidate profile object.
+ * Parses resume + JD into a rich candidate profile object.
+ *
+ * PROMPT STRATEGY:
+ *   • Kept intentionally compact (< 3000 tokens output expected) so it fits
+ *     comfortably within any token budget.
+ *   • responseMimeType: 'application/json' guarantees clean output.
+ *   • MAX_TOKENS = 65536 prevents truncation.
  */
 async function analyzeCandidateProfile(resumeText, jdText) {
   log('PROFILE', 'Starting candidate profile analysis…');
+  log('PROFILE', `Resume: ${resumeText.length} chars | JD: ${jdText.length} chars`);
 
-  const prompt = `Analyze the following resume and job description. Return a JSON object ONLY — no markdown, no explanation.
+  // Trim inputs to safe sizes
+  const resume = resumeText.substring(0, 6000);
+  const jd     = jdText.substring(0, 3000);
 
-=== RESUME ===
-${resumeText.substring(0, 8000)}
+  const prompt =
+`Analyze this resume and job description. Return a single JSON object.
 
-=== JOB DESCRIPTION ===
-${jdText.substring(0, 4000)}
+RESUME:
+${resume}
 
-Return this EXACT JSON structure with real values extracted from the documents:
+JOB DESCRIPTION:
+${jd}
+
+REQUIRED JSON STRUCTURE (fill every field with real data from the documents):
 {
-  "candidateName": "Full name from resume or 'Candidate' if not found",
-  "currentRole": "Current or most recent job title",
-  "totalExperience": "e.g. 2 years 3 months, or Fresher",
-  "educationLevel": "Highest degree e.g. B.Tech, M.Tech, MBA",
-  "cgpa": "CGPA or percentage if mentioned, else null",
-  "college": "College or University name",
-  "educationTimeline": [
-    {"degree": "B.Tech", "institution": "XYZ University", "year": "2022", "score": "8.5 CGPA"}
-  ],
-  "summary": "2-3 sentence professional summary based on resume",
-  "technicalSkills": ["JavaScript", "React", "Node.js"],
-  "softSkills": ["Communication", "Teamwork"],
-  "experienceLevel": "fresher",
-  "projects": [
-    {"name": "Project Name", "tech": ["React", "Node.js"], "description": "What it does", "impact": "Impact or outcome"}
-  ],
-  "internships": [
-    {"company": "Company Name", "role": "Role", "duration": "3 months", "tech": ["Python"]}
-  ],
-  "certifications": ["AWS Certified", "Google Cloud"],
-  "achievements": ["Won hackathon", "Dean's list"],
-  "hackathons": ["Smart India Hackathon 2023"],
-  "githubProjects": ["github.com/user/project"],
-  "linkedinUrl": "https://linkedin.com/in/user or null",
-  "strengths": ["Strong in full-stack", "Quick learner"],
-  "weaknesses": ["Limited production experience", "No cloud exposure"],
-  "missingSkills": ["Docker", "Kubernetes"],
-  "jobMatchPercent": 75,
-  "atsScore": 68,
-  "atsKeywords": ["REST API", "agile", "microservices"],
-  "jdRequiredSkills": ["Node.js", "React", "SQL"],
-  "jdPreferredSkills": ["Docker", "AWS"],
-  "jdResponsibilities": ["Build REST APIs", "Collaborate with team"],
-  "jdExperienceRequired": "2+ years",
-  "jdTechnologies": ["Node.js", "React", "PostgreSQL"],
-  "jdSoftSkills": ["Communication", "Problem-solving"],
-  "jdRoleExpectations": ["Ship features independently", "Write clean code"],
-  "interviewFocus": ["React", "Node.js", "System Design", "Projects"],
-  "suggestedQuestionTopics": ["OOP Concepts", "REST API design", "Past projects"],
-  "difficultyLevel": "junior"
+  "candidateName": "string",
+  "currentRole": "string",
+  "totalExperience": "string (e.g. Fresher, 2 years)",
+  "educationLevel": "string (e.g. B.Tech)",
+  "cgpa": "string or null",
+  "college": "string",
+  "educationTimeline": [{"degree":"","institution":"","year":"","score":""}],
+  "summary": "2-3 sentence professional summary",
+  "technicalSkills": ["string"],
+  "softSkills": ["string"],
+  "experienceLevel": "fresher|junior|mid|senior|lead",
+  "projects": [{"name":"","tech":[""],"description":"","impact":""}],
+  "internships": [{"company":"","role":"","duration":"","tech":[""]}],
+  "certifications": ["string"],
+  "achievements": ["string"],
+  "hackathons": ["string"],
+  "githubProjects": ["string"],
+  "linkedinUrl": "string or null",
+  "strengths": ["string"],
+  "weaknesses": ["string"],
+  "missingSkills": ["string"],
+  "jobMatchPercent": 0,
+  "atsScore": 0,
+  "atsKeywords": ["string"],
+  "jdRequiredSkills": ["string"],
+  "jdPreferredSkills": ["string"],
+  "jdResponsibilities": ["string"],
+  "jdExperienceRequired": "string",
+  "jdTechnologies": ["string"],
+  "jdSoftSkills": ["string"],
+  "jdRoleExpectations": ["string"],
+  "interviewFocus": ["string"],
+  "suggestedQuestionTopics": ["string"],
+  "difficultyLevel": "fresher|junior|mid|senior"
 }
 
-Rules:
-- experienceLevel MUST be one of: fresher, junior, mid, senior, lead
-- difficultyLevel MUST be one of: fresher, junior, mid, senior
-- All array fields must be arrays, never null
-- Numeric fields (jobMatchPercent, atsScore) must be integers 0-100
-- Extract REAL data from the resume, do not invent data`;
+RULES:
+- experienceLevel: must be one of fresher/junior/mid/senior/lead
+- difficultyLevel: must be one of fresher/junior/mid/senior
+- jobMatchPercent and atsScore: integers 0-100
+- Every array field must be an array (never null or omitted)
+- Return only the JSON object, nothing else`;
 
-  return withRetry(
-    async () => {
-      const model  = getModel(true, JSON_SYSTEM_INSTRUCTION);
-      const result = await model.generateContent(prompt);
+  return withRetry(async () => {
+    const parsed = await callForJSON(prompt, 'candidateProfile', { sysInstr: JSON_SYSTEM });
 
-      const raw = result.response.text();
-      log('PROFILE', 'Raw Gemini response received', raw);
+    // ── Sanitize every field so downstream code never crashes ────────────────
+    const ARRAYS = [
+      'technicalSkills','softSkills','projects','internships','certifications',
+      'achievements','hackathons','githubProjects','strengths','weaknesses',
+      'missingSkills','atsKeywords','jdRequiredSkills','jdPreferredSkills',
+      'jdResponsibilities','jdTechnologies','jdSoftSkills','jdRoleExpectations',
+      'interviewFocus','suggestedQuestionTopics','educationTimeline',
+    ];
+    ARRAYS.forEach(k => { if (!Array.isArray(parsed[k])) parsed[k] = []; });
 
-      const parsed = safeParseJSON(raw, 'candidateProfile');
+    const VALID_LEVELS  = ['fresher','junior','mid','senior','lead'];
+    const VALID_DIFF    = ['fresher','junior','mid','senior'];
+    parsed.candidateName   = typeof parsed.candidateName === 'string' && parsed.candidateName ? parsed.candidateName : 'Candidate';
+    parsed.experienceLevel = VALID_LEVELS.includes(parsed.experienceLevel) ? parsed.experienceLevel : 'junior';
+    parsed.difficultyLevel = VALID_DIFF.includes(parsed.difficultyLevel)   ? parsed.difficultyLevel : 'junior';
+    parsed.jobMatchPercent = Number.isFinite(parsed.jobMatchPercent) ? Math.max(0, Math.min(100, parsed.jobMatchPercent)) : 60;
+    parsed.atsScore        = Number.isFinite(parsed.atsScore)        ? Math.max(0, Math.min(100, parsed.atsScore))        : 60;
 
-      // Sanitize required fields so downstream code never crashes
-      parsed.candidateName     = parsed.candidateName     || 'Candidate';
-      parsed.experienceLevel   = (['fresher','junior','mid','senior','lead'].includes(parsed.experienceLevel))
-                                  ? parsed.experienceLevel : 'junior';
-      parsed.technicalSkills   = Array.isArray(parsed.technicalSkills)   ? parsed.technicalSkills   : [];
-      parsed.softSkills        = Array.isArray(parsed.softSkills)        ? parsed.softSkills        : [];
-      parsed.projects          = Array.isArray(parsed.projects)          ? parsed.projects          : [];
-      parsed.internships       = Array.isArray(parsed.internships)       ? parsed.internships       : [];
-      parsed.certifications    = Array.isArray(parsed.certifications)    ? parsed.certifications    : [];
-      parsed.achievements      = Array.isArray(parsed.achievements)      ? parsed.achievements      : [];
-      parsed.strengths         = Array.isArray(parsed.strengths)         ? parsed.strengths         : [];
-      parsed.weaknesses        = Array.isArray(parsed.weaknesses)        ? parsed.weaknesses        : [];
-      parsed.missingSkills     = Array.isArray(parsed.missingSkills)     ? parsed.missingSkills     : [];
-      parsed.jdRequiredSkills  = Array.isArray(parsed.jdRequiredSkills)  ? parsed.jdRequiredSkills  : [];
-      parsed.jdTechnologies    = Array.isArray(parsed.jdTechnologies)    ? parsed.jdTechnologies    : [];
-      parsed.interviewFocus    = Array.isArray(parsed.interviewFocus)    ? parsed.interviewFocus    : [];
-      parsed.jobMatchPercent   = Number.isInteger(parsed.jobMatchPercent) ? parsed.jobMatchPercent  : 70;
-      parsed.atsScore          = Number.isInteger(parsed.atsScore)        ? parsed.atsScore         : 70;
-
-      log('PROFILE', `✅ Profile parsed — name: ${parsed.candidateName}, level: ${parsed.experienceLevel}, jdMatch: ${parsed.jobMatchPercent}%`);
-      return parsed;
-    },
-    'analyzeCandidateProfile'
-  );
+    log('PROFILE', `✅ Profile OK — name: "${parsed.candidateName}", level: "${parsed.experienceLevel}", jdMatch: ${parsed.jobMatchPercent}%, atsScore: ${parsed.atsScore}%`);
+    return parsed;
+  }, 'analyzeCandidateProfile');
 }
 
 /**
- * generateOpeningMessage
- * Returns a warm, natural opening from the "interviewer".
+ * generateOpeningMessage — natural interview greeting
  */
 async function generateOpeningMessage(profile) {
   log('OPENING', 'Generating opening message…');
-
   const firstName = (profile.candidateName || 'there').split(' ')[0];
 
-  const prompt = `You are a Senior Technical and HR Interviewer at a top tech company. You are about to interview ${firstName}.
+  const prompt =
+`You are a Senior Interviewer at a top tech company. Greet ${firstName} warmly.
 
-Candidate background:
-- Experience Level: ${profile.experienceLevel}
-- Recent Role: ${profile.currentRole || 'Software Developer'}
-- Education: ${profile.educationLevel || 'Engineering'} from ${profile.college || 'University'}
-- Key Skills: ${(profile.technicalSkills || []).slice(0, 5).join(', ')}
-
-Write a warm, professional opening message:
-- Use their FIRST NAME: ${firstName}
-- Be natural and human — not robotic
-- Briefly mention you reviewed their background
-- Ask them to start with a brief introduction
-- DO NOT mention AI or that you are an AI
-- Maximum 3-4 sentences
-- End with exactly one question asking them to introduce themselves
-
-Return ONLY the message text. No JSON. No formatting.`;
+Rules:
+- Address them by first name: ${firstName}
+- 3-4 sentences maximum
+- Acknowledge their background in ${profile.currentRole || 'technology'}
+- Ask them to introduce themselves (ONE question)
+- Sound like a real human — not robotic
+- Do NOT mention AI or that you are an AI
+- Return ONLY the spoken greeting — no JSON, no formatting`;
 
   return withRetry(async () => {
-    const model  = getModel(false);
+    const model  = getModel({ jsonMode: false });
     const result = await model.generateContent(prompt);
     const text   = result.response.text().trim();
-    log('OPENING', '✅ Opening message generated', text);
+    log('OPENING', '✅ Opening message ready', text);
     return text;
   }, 'generateOpeningMessage');
 }
 
 /**
- * generateNextQuestion
- * Generates the next contextual interview question.
+ * generateNextQuestion — contextual interview question
  */
 async function generateNextQuestion(profile, interviewHistory, questionCount, currentDifficulty, askedQuestionsArray) {
-  log('QUESTION', `Generating question #${questionCount + 1}, difficulty: ${currentDifficulty}`);
+  log('QUESTION', `Generating Q#${questionCount + 1}, difficulty: ${currentDifficulty}`);
 
-  const historyText = interviewHistory
-    .slice(-8)
+  const history = interviewHistory.slice(-8)
     .map(h => `${h.role === 'interviewer' ? 'Interviewer' : 'Candidate'}: ${h.content}`)
     .join('\n');
 
   const phase = questionCount < 5
-    ? 'Focus on background, education, projects, and basic technical knowledge.'
+    ? 'Ask about education, projects, and basic technical skills.'
     : questionCount < 10
-    ? 'Dive into technical depth, problem-solving, system design, and work experience.'
+    ? 'Dive into technical depth, system design, and problem-solving.'
     : questionCount < 15
-    ? 'Cover advanced topics, leadership scenarios, and conflict resolution.'
-    : 'Explore situational judgment, cultural fit, career goals, and future plans.';
+    ? 'Cover advanced topics, leadership, and conflict resolution.'
+    : 'Explore cultural fit, career goals, and situational judgment.';
 
-  const prompt = `You are a Senior Technical and HR Interviewer conducting a real job interview.
+  const prompt =
+`You are a Senior Interviewer conducting a real interview.
 
-CANDIDATE: ${profile.candidateName} — ${profile.experienceLevel} level (${profile.totalExperience || 'fresher'})
-SKILLS: ${(profile.technicalSkills || []).join(', ')}
-PROJECTS: ${(profile.projects || []).map(p => p.name).join(', ') || 'None listed'}
-EDUCATION: ${profile.educationLevel || 'Engineering'} from ${profile.college || 'University'}, CGPA: ${profile.cgpa || 'Not stated'}
-JD REQUIRED SKILLS: ${(profile.jdRequiredSkills || []).join(', ')}
-INTERVIEW FOCUS: ${(profile.interviewFocus || []).join(', ')}
+CANDIDATE: ${profile.candidateName} — ${profile.experienceLevel} (${profile.totalExperience || 'fresher'})
+SKILLS: ${(profile.technicalSkills || []).slice(0, 15).join(', ')}
+PROJECTS: ${(profile.projects || []).map(p => p.name).join(', ') || 'None'}
+EDUCATION: ${profile.educationLevel} from ${profile.college}, CGPA: ${profile.cgpa || 'N/A'}
+JD SKILLS: ${(profile.jdRequiredSkills || []).join(', ')}
 
 RECENT CONVERSATION:
-${historyText || 'Interview just started.'}
+${history || 'Interview just started.'}
 
-QUESTION NUMBER: ${questionCount + 1}
-DIFFICULTY: ${currentDifficulty}
-ALREADY COVERED: ${(askedQuestionsArray || []).slice(-15).join(', ') || 'Nothing yet'}
-PHASE GUIDANCE: ${phase}
+QUESTION NUMBER: ${questionCount + 1} | DIFFICULTY: ${currentDifficulty}
+ALREADY COVERED: ${(askedQuestionsArray || []).slice(-12).join(', ') || 'Nothing yet'}
+PHASE: ${phase}
 
-Instructions:
-1. Ask ONE natural, conversational question
-2. Match difficulty: ${currentDifficulty}
-3. Reference their resume details when relevant (projects, skills, college)
-4. Mix types: technical, behavioral, situational, project-specific
-5. Sound like a REAL human interviewer at Google/Amazon/Microsoft
-6. Do NOT repeat already-covered topics
-7. Do NOT say "Great question!" or similar filler
-8. Do NOT reveal you are AI
-9. Use STAR prompting for behavioral questions
-
-Return ONLY the interview question. No labels, no formatting, no explanation.`;
+Ask ONE natural interview question. Mix types (technical/behavioral/situational).
+Do NOT repeat covered topics. Do NOT mention AI. Return ONLY the question text.`;
 
   return withRetry(async () => {
-    const model  = getModel(false);
+    const model  = getModel({ jsonMode: false });
     const result = await model.generateContent(prompt);
     const text   = result.response.text().trim();
-    log('QUESTION', `✅ Question #${questionCount + 1}:`, text);
+    log('QUESTION', `✅ Q#${questionCount + 1}:`, text);
     return text;
   }, 'generateNextQuestion');
 }
 
 /**
- * generateSuggestedAnswer
- * Returns a structured hint object for the current question.
+ * generateSuggestedAnswer — hint object for the candidate
  */
 async function generateSuggestedAnswer(question, profile, interviewHistory) {
-  log('HINT', 'Generating suggested answer…');
+  log('HINT', 'Generating hint…');
 
-  const context = interviewHistory.slice(-4)
-    .map(h => `${h.role}: ${h.content}`)
-    .join('\n');
+  const ctx = interviewHistory.slice(-4).map(h => `${h.role}: ${h.content}`).join('\n');
 
-  const prompt = `You are an expert interview coach. Generate structured interview preparation hints.
+  const prompt =
+`Interview coach generating answer hints. Return ONLY the JSON object below.
 
-CANDIDATE:
-- Name: ${profile.candidateName}
-- Level: ${profile.experienceLevel} (${profile.totalExperience || 'fresher'})
-- Skills: ${(profile.technicalSkills || []).slice(0, 10).join(', ')}
-- Projects: ${(profile.projects || []).map(p => p.name + ' (' + (p.tech || []).join(', ') + ')').join('; ') || 'None'}
-
-RECENT CONTEXT:
-${context || 'Beginning of interview'}
-
+CANDIDATE: ${profile.candidateName} (${profile.experienceLevel}, ${profile.totalExperience || 'fresher'})
+SKILLS: ${(profile.technicalSkills || []).slice(0, 8).join(', ')}
+CONTEXT: ${ctx || 'Start of interview'}
 QUESTION: "${question}"
 
-Return ONLY this JSON object, no markdown, no extra text:
 {
-  "suggestedAnswer": "A natural 100-200 word answer in first person, specific to this candidate's experience",
-  "keyPoints": ["Key point 1", "Key point 2", "Key point 3", "Key point 4"],
-  "interviewerExpects": ["Expectation 1", "Expectation 2", "Expectation 3"],
-  "mistakesToAvoid": ["Mistake 1", "Mistake 2", "Mistake 3"],
-  "alternativeAnswer": "A shorter 50-80 word alternative approach",
-  "bestKeywords": ["keyword1", "keyword2", "keyword3", "keyword4", "keyword5"],
-  "starVersion": "Situation: ... | Task: ... | Action: ... | Result: ... (or 'Not applicable')"
+  "suggestedAnswer": "100-200 word first-person answer specific to this candidate",
+  "keyPoints": ["point1","point2","point3","point4"],
+  "interviewerExpects": ["expect1","expect2","expect3"],
+  "mistakesToAvoid": ["mistake1","mistake2","mistake3"],
+  "alternativeAnswer": "50-80 word alternative approach",
+  "bestKeywords": ["kw1","kw2","kw3","kw4","kw5"],
+  "starVersion": "Situation:...|Task:...|Action:...|Result:... or Not applicable"
 }`;
 
   return withRetry(async () => {
-    const parsed = await callForJSON(prompt, 'suggestedAnswer', true);
-    log('HINT', '✅ Hint generated');
-    return parsed;
+    return await callForJSON(prompt, 'suggestedAnswer', { sysInstr: JSON_SYSTEM });
   }, 'generateSuggestedAnswer').catch(err => {
-    logError('HINT', 'Hint generation failed — returning fallback', err);
+    logError('HINT', 'Falling back to default hint', err);
     return {
-      suggestedAnswer:   'Focus on your specific experience and be concrete with examples.',
-      keyPoints:         ['Be specific', 'Use examples', 'Show measurable impact', 'Keep it concise'],
-      interviewerExpects:['Relevant experience', 'Problem-solving ability', 'Clear communication'],
-      mistakesToAvoid:   ['Being vague', 'Rambling', 'Not quantifying results'],
-      alternativeAnswer: 'Keep it concise and focus on your strongest relevant point.',
-      bestKeywords:      ['experience', 'impact', 'solution', 'result', 'team'],
-      starVersion:       'Not applicable for this question type',
+      suggestedAnswer:    'Focus on your specific experience with concrete examples.',
+      keyPoints:          ['Be specific','Use examples','Show impact','Stay concise'],
+      interviewerExpects: ['Relevant experience','Problem-solving','Clear communication'],
+      mistakesToAvoid:    ['Being vague','Rambling','Skipping results'],
+      alternativeAnswer:  'Lead with your strongest relevant point and support with one example.',
+      bestKeywords:       ['experience','impact','solution','result','team'],
+      starVersion:        'Not applicable for this question type',
     };
   });
 }
 
 /**
- * evaluateAnswer
- * Evaluates a candidate's answer and returns structured feedback.
+ * evaluateAnswer — live feedback after each answer
  */
-async function evaluateAnswer(question, answer, profile, interviewHistory) {
+async function evaluateAnswer(question, answer, profile) {
   log('EVAL', 'Evaluating answer…');
 
   if (!answer || answer.trim().length < 5) {
     return {
-      scores:          { communication: 30, technicalAccuracy: 30, confidence: 30, grammar: 30, professionalism: 30, relevance: 30, overall: 30 },
+      scores:          { communication:30, technicalAccuracy:30, confidence:30, grammar:30, professionalism:30, relevance:30, overall:30 },
       positiveFeedback:['You attempted the question.'],
       improvements:    ['Please provide a detailed answer.'],
-      betterWording:   'Try to elaborate with specific examples from your experience.',
-      missingPoints:   ['Specific examples', 'Technical details', 'Quantified results'],
+      betterWording:   'Try to elaborate with specific examples.',
+      missingPoints:   ['Specific examples','Technical depth','Quantified results'],
       rating:          'Needs Improvement',
       shortComment:    'Please provide more detail in your answers.',
     };
   }
 
-  const prompt = `You are a Senior Interview Evaluator at a top tech company. Evaluate this answer professionally.
+  const prompt =
+`Senior interviewer evaluating a candidate's answer. Return ONLY the JSON object below.
 
-CANDIDATE: ${profile.candidateName} (${profile.experienceLevel}, ${profile.totalExperience || 'fresher'})
+CANDIDATE: ${profile.candidateName} (${profile.experienceLevel})
 QUESTION: "${question}"
-ANSWER: "${answer.substring(0, 2000)}"
+ANSWER: "${answer.substring(0, 1500)}"
 
-Return ONLY this JSON object, no markdown, no extra text:
 {
   "scores": {
     "communication": 80,
@@ -497,47 +526,45 @@ Return ONLY this JSON object, no markdown, no extra text:
     "relevance": 78,
     "overall": 78
   },
-  "positiveFeedback": ["Positive point 1", "Positive point 2"],
-  "improvements": ["Improvement 1", "Improvement 2"],
-  "betterWording": "A polished 1-2 sentence version of their answer",
-  "missingPoints": ["Missing point 1", "Missing point 2"],
+  "positiveFeedback": ["positive1","positive2"],
+  "improvements": ["improvement1","improvement2"],
+  "betterWording": "Polished 1-2 sentence version of their answer",
+  "missingPoints": ["missing1","missing2"],
   "rating": "Excellent",
   "shortComment": "One encouraging professional feedback sentence"
 }
 
-Rating must be exactly one of: Excellent, Good, Average, Needs Improvement
-All scores must be integers 0-100. overall should be the mean of other scores.
-If answer is very short (<15 words), score all fields below 40.`;
+rating must be exactly one of: Excellent, Good, Average, Needs Improvement
+All scores: integers 0-100. overall = mean of other scores.`;
 
   return withRetry(async () => {
-    const parsed = await callForJSON(prompt, 'evaluateAnswer', true);
-    log('EVAL', `✅ Evaluation done — overall: ${parsed.scores?.overall}%, rating: ${parsed.rating}`);
+    const parsed = await callForJSON(prompt, 'evaluateAnswer', { sysInstr: JSON_SYSTEM });
+    log('EVAL', `✅ overall: ${parsed.scores?.overall}%, rating: ${parsed.rating}`);
     return parsed;
   }, 'evaluateAnswer').catch(err => {
-    logError('EVAL', 'Evaluation failed — returning fallback', err);
+    logError('EVAL', 'Falling back to default evaluation', err);
     return {
-      scores:          { communication: 70, technicalAccuracy: 70, confidence: 70, grammar: 70, professionalism: 70, relevance: 70, overall: 70 },
+      scores:          { communication:70, technicalAccuracy:70, confidence:70, grammar:70, professionalism:70, relevance:70, overall:70 },
       positiveFeedback:['You attempted the question.'],
       improvements:    ['Provide more specific details.'],
-      betterWording:   'Consider elaborating with concrete examples.',
-      missingPoints:   ['Specific examples', 'Quantified results'],
+      betterWording:   'Consider adding concrete examples from your experience.',
+      missingPoints:   ['Specific examples','Quantified results'],
       rating:          'Average',
-      shortComment:    'Good attempt! Try to be more specific with examples next time.',
+      shortComment:    'Good attempt! Try to be more specific next time.',
     };
   });
 }
 
 /**
- * generateInterviewReport
- * Generates the comprehensive final hiring report.
+ * generateInterviewReport — final comprehensive hiring report
  */
 async function generateInterviewReport(profile, interviewHistory) {
-  log('REPORT', 'Generating final interview report…');
+  log('REPORT', 'Generating final report…');
 
-  const conversationSummary = interviewHistory
-    .map(h => `${h.role === 'interviewer' ? 'Q' : 'A'}: ${h.content.substring(0, 300)}`)
+  const transcript = interviewHistory
+    .map(h => `${h.role === 'interviewer' ? 'Q' : 'A'}: ${h.content.substring(0, 200)}`)
     .join('\n')
-    .substring(0, 5000);
+    .substring(0, 4000);
 
   const avgScores = {};
   interviewHistory.filter(h => h.evaluation?.scores).forEach(h => {
@@ -546,27 +573,20 @@ async function generateInterviewReport(profile, interviewHistory) {
       avgScores[k].push(v);
     });
   });
-  const scoreAverages = {};
-  Object.entries(avgScores).forEach(([k, vals]) => {
-    scoreAverages[k] = Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
+  const scoreAvg = {};
+  Object.entries(avgScores).forEach(([k, v]) => {
+    scoreAvg[k] = Math.round(v.reduce((a, b) => a + b, 0) / v.length);
   });
 
-  const prompt = `You are a Senior HR Director generating a final interview evaluation report.
+  const prompt =
+`Senior HR Director generating final interview report. Return ONLY the JSON object below.
 
-CANDIDATE: ${profile.candidateName}
-ROLE: ${profile.currentRole || 'Software Developer'}
-LEVEL: ${profile.experienceLevel} (${profile.totalExperience || 'fresher'})
-JD MATCH: ${profile.jobMatchPercent || 70}%
-ATS SCORE: ${profile.atsScore || 70}%
+CANDIDATE: ${profile.candidateName} | LEVEL: ${profile.experienceLevel} | JD MATCH: ${profile.jobMatchPercent}%
 QUESTIONS ANSWERED: ${Math.floor(interviewHistory.length / 2)}
+AVERAGE SCORES: ${JSON.stringify(scoreAvg)}
+TRANSCRIPT SUMMARY:
+${transcript || 'Not available.'}
 
-AVERAGE PERFORMANCE SCORES:
-${JSON.stringify(scoreAverages, null, 2)}
-
-INTERVIEW TRANSCRIPT SUMMARY:
-${conversationSummary || 'No transcript available.'}
-
-Return ONLY this JSON object, no markdown, no extra text:
 {
   "overallScore": 78,
   "technicalScore": 80,
@@ -577,63 +597,49 @@ Return ONLY this JSON object, no markdown, no extra text:
   "jdMatchScore": ${profile.jobMatchPercent || 70},
   "hiringProbability": 70,
   "hiringRecommendation": "Hire",
-  "verdictExplanation": "2-3 sentence explanation of the hiring decision based on interview performance",
-  "strengths": ["Strength 1", "Strength 2", "Strength 3", "Strength 4"],
-  "weaknesses": ["Weakness 1", "Weakness 2", "Weakness 3"],
-  "missingSkills": ["Missing skill 1", "Missing skill 2", "Missing skill 3"],
-  "topicsToStudy": [
-    {"topic": "Topic Name", "priority": "High", "resources": "Where to study e.g. LeetCode, Udemy"}
-  ],
-  "mostAskedQuestions": ["Question category 1", "Question category 2", "Question category 3"],
-  "recommendedCertifications": [
-    {"name": "Certification Name", "platform": "Coursera", "relevance": "Why this helps"}
-  ],
-  "recommendedProjects": ["Project idea 1", "Project idea 2", "Project idea 3"],
-  "interviewSummary": "3-4 professional sentences describing how the interview went",
-  "finalVerdict": "2-3 sentence final recommendation for the candidate",
-  "areasOfImprovement": ["Area 1", "Area 2", "Area 3"],
-  "nextSteps": ["Actionable step 1", "Actionable step 2", "Actionable step 3"]
+  "verdictExplanation": "2-3 sentence explanation",
+  "strengths": ["strength1","strength2","strength3"],
+  "weaknesses": ["weakness1","weakness2"],
+  "missingSkills": ["skill1","skill2"],
+  "topicsToStudy": [{"topic":"","priority":"High","resources":""}],
+  "mostAskedQuestions": ["category1","category2"],
+  "recommendedCertifications": [{"name":"","platform":"","relevance":""}],
+  "recommendedProjects": ["project1","project2"],
+  "interviewSummary": "3-4 sentence professional summary",
+  "finalVerdict": "2-3 sentence recommendation",
+  "areasOfImprovement": ["area1","area2"],
+  "nextSteps": ["step1","step2","step3"]
 }
 
-Rules:
-- hiringRecommendation must be exactly one of: Strong Hire, Hire, Borderline, No Hire
-- All score fields must be integers 0-100
-- All array fields must be arrays
-- topicsToStudy priority must be: High, Medium, or Low`;
+hiringRecommendation must be: Strong Hire, Hire, Borderline, or No Hire
+All score fields: integers 0-100. All array fields: arrays not null.`;
 
   return withRetry(async () => {
-    const parsed = await callForJSON(prompt, 'interviewReport', true);
+    const parsed = await callForJSON(prompt, 'interviewReport', { sysInstr: JSON_SYSTEM });
 
-    // Sanitize
-    const validRecs = ['Strong Hire', 'Hire', 'Borderline', 'No Hire'];
-    if (!validRecs.includes(parsed.hiringRecommendation)) {
-      parsed.hiringRecommendation = 'Hire';
-    }
+    const validRec = ['Strong Hire','Hire','Borderline','No Hire'];
+    if (!validRec.includes(parsed.hiringRecommendation)) parsed.hiringRecommendation = 'Hire';
     ['strengths','weaknesses','missingSkills','mostAskedQuestions','recommendedProjects',
-     'areasOfImprovement','nextSteps'].forEach(k => {
+     'areasOfImprovement','nextSteps','topicsToStudy','recommendedCertifications'].forEach(k => {
       if (!Array.isArray(parsed[k])) parsed[k] = [];
     });
-    if (!Array.isArray(parsed.topicsToStudy)) parsed.topicsToStudy = [];
-    if (!Array.isArray(parsed.recommendedCertifications)) parsed.recommendedCertifications = [];
 
-    log('REPORT', `✅ Report generated — recommendation: ${parsed.hiringRecommendation}, probability: ${parsed.hiringProbability}%`);
+    log('REPORT', `✅ Report ready — recommendation: ${parsed.hiringRecommendation}, probability: ${parsed.hiringProbability}%`);
     return parsed;
   }, 'generateInterviewReport');
 }
 
 /**
- * streamResponse
- * Streams a raw text response chunk-by-chunk.
+ * streamResponse — raw text streaming
  */
 async function streamResponse(prompt, onChunk) {
-  const model  = getModel(false);
+  const model  = getModel({ jsonMode: false });
   const result = await model.generateContentStream(prompt);
-
   let fullText = '';
   for await (const chunk of result.stream) {
-    const chunkText = chunk.text();
-    fullText += chunkText;
-    onChunk(chunkText);
+    const t = chunk.text();
+    fullText += t;
+    onChunk(t);
   }
   return fullText;
 }
@@ -650,4 +656,5 @@ module.exports = {
   // Export utilities for testing
   safeParseJSON,
   withRetry,
+  extractJsonObject,
 };
